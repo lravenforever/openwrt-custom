@@ -1,0 +1,4 @@
+openwrt/
+firmware/
+*.log
+.DS_Store

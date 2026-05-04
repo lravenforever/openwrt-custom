@@ -1,0 +1,173 @@
+name: Build OpenWrt Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a GitHub Release after a successful build"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  push:
+    paths:
+      - ".github/workflows/openwrt-builder.yml"
+      - ".config"
+      - "diy-part1.sh"
+      - "diy-part2.sh"
+      - "scripts/**"
+      - "README.md"
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_REPO: https://github.com/openwrt/openwrt.git
+  OPENWRT_REF: v25.12.2
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build OpenWrt 25.12.2 x86_64 UEFI
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Show initial disk space
+        run: df -hT
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /opt/az || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -hT
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync unzip zlib1g-dev file wget subversion swig time \
+            xsltproc ccache libelf-dev device-tree-compiler qemu-utils \
+            jq curl ca-certificates
+
+      - name: Clone OpenWrt source
+        run: |
+          git clone --depth 1 --branch "${OPENWRT_REF}" "${OPENWRT_REPO}" openwrt
+
+      - name: Run diy-part1 before feeds update
+        working-directory: openwrt
+        run: |
+          if [ -f "../${DIY_P1_SH}" ]; then
+            chmod +x "../${DIY_P1_SH}"
+            "../${DIY_P1_SH}"
+          fi
+          echo "===== feeds.conf.default ====="
+          cat feeds.conf.default
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Run diy-part2 after feeds install
+        working-directory: openwrt
+        run: |
+          if [ -f "../${DIY_P2_SH}" ]; then
+            chmod +x "../${DIY_P2_SH}"
+            "../${DIY_P2_SH}"
+          fi
+
+      - name: Restore downloads cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: openwrt-dl-${{ env.OPENWRT_REF }}-${{ runner.os }}-${{ hashFiles('.config', 'diy-part1.sh', 'diy-part2.sh') }}
+          restore-keys: |
+            openwrt-dl-${{ env.OPENWRT_REF }}-${{ runner.os }}-
+            openwrt-dl-${{ env.OPENWRT_REF }}-
+
+      - name: Apply config and verify selected packages
+        working-directory: openwrt
+        run: |
+          cp "../${CONFIG_FILE}" .config
+          make defconfig
+          echo "===== requested package check ====="
+          grep -E "CONFIG_(GRUB_EFI_IMAGES|PACKAGE_(luci-app-oaf|adguardhome|luci-app-adguardhome|ddns-go|luci-app-ddns-go|luci-app-eqosplus|netdata|luci-app-netdata|luci-app-nft-timecontrol|luci-app-timecontrol|luci-app-nlbwmon|luci-app-statistics|luci-app-ttyd|luci-theme-argon|luci-app-package-manager))=y" .config || true
+          python3 ../scripts/check_config.py .config
+
+      - name: Download source packages
+        working-directory: openwrt
+        run: |
+          make download -j"$(nproc)"
+          find dl -size -1024c -delete
+
+      - name: Compile firmware
+        working-directory: openwrt
+        run: |
+          make -j"$(nproc)" V=s || make -j1 V=s
+
+      - name: Organize firmware files
+        id: organize
+        run: |
+          set -e
+          mkdir -p firmware
+          find openwrt/bin/targets -type f \
+            \( -name "*.bin" -o -name "*.img" -o -name "*.img.gz" -o -name "*.tar" -o -name "*.tar.gz" -o -name "*.itb" -o -name "*.ubi" -o -name "*.manifest" -o -name "*.buildinfo" -o -name "*.json" \) \
+            -exec cp --parents {} firmware/ \;
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "===== firmware output ====="
+          find firmware -type f | sort
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-25.12.2-x86_64-uefi-oaf-firmware
+          path: firmware/
+          retention-days: 14
+
+      - name: Create release tag
+        id: tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release == 'true' && steps.organize.outputs.status == 'success'
+        run: |
+          echo "release_tag=openwrt-25.12.2-x86_64-uefi-oaf-$(date +'%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
+          cat > release.txt <<'EOF'
+          OpenWrt 25.12.2 x86_64 UEFI firmware build completed.
+
+For a UEFI BIOS x86 device, use the file whose name contains combined-efi.img.gz.
+
+          Included main plugins:
+          - luci-app-oaf
+          - luci-app-adguardhome
+          - luci-app-ddns-go
+          - luci-app-eqosplus
+          - luci-app-netdata
+          - luci-app-nft-timecontrol or luci-app-timecontrol, depending on upstream package name
+          - luci-app-nlbwmon
+          - luci-app-statistics
+          - luci-app-ttyd
+          - luci-theme-argon
+          EOF
+
+      - name: Upload GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.release == 'true' && steps.organize.outputs.status == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          body_path: release.txt
+          files: |
+            firmware/**/*
